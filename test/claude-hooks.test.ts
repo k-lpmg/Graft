@@ -1,14 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { underGraft, main, lastFileScopeHint, promptAskTimeout } from '../src/claude/hooks.js';
+import { underGraft, main, lastFileScopeHint, promptAskTimeout, shadowedByRepoHook } from '../src/claude/hooks.js';
 import { readStats, readSession } from '../src/claude/state.js';
 import { runSync } from '../src/claude/sync-run.js';
 import { savingsLine } from '../src/context/savings.js';
 import { CI_ENV_VARS } from '../src/telemetry/gate.js';
 import { writeStats, emptyStats, acquireLock, resolveContextDir } from '../src/claude/state.js';
+import { tmpRepo } from './helpers.js';
 
 test('underGraft detects edits inside graft/', () => {
   assert.equal(underGraft('/repo', '/repo/graft/x.md'), true);
@@ -751,3 +752,92 @@ test('session-start reads INDEX.md from a GRAFT_DIR-relocated context dir', asyn
   }
   assert.match(chunks.join(''), /repo map \(relocated\)/, 'orientation was built from the relocated INDEX.md');
 });
+
+// ── Two copies of one hook. `graft init` wires the repo's own `.claude/settings.json`
+// and, since #276, `~/.claude/settings.json` as well — the floor that keeps graft alive
+// in a worktree whose `.gitignore` swallowed the repo files. Claude Code runs every
+// matching entry, so a repo carrying both copies fires each hook twice. Only the repo's
+// copy should act. ──────────────────────────────────────────────────────────────────
+
+/** A repo `graft init` wired: its own shim, and settings that run it for `events`. */
+function repoRunning(...events: string[]): string {
+  const d = tmpRepo('twohooks');
+  mkdirSync(join(d, '.claude', 'helpers'), { recursive: true });
+  writeFileSync(join(d, '.claude', 'helpers', 'graft-hooks.cjs'), '// the repo shim\n');
+  const hooks: Record<string, unknown[]> = {};
+  for (const e of events) {
+    const key = ({ prompt: 'UserPromptSubmit', stop: 'Stop', 'session-start': 'SessionStart' } as Record<string, string>)[e] ?? 'PostToolUse';
+    (hooks[key] ??= []).push({ hooks: [{ type: 'command', command: `node "\${CLAUDE_PROJECT_DIR:-.}/.claude/helpers/graft-hooks.cjs" ${e}`, timeout: 8000 }] });
+  }
+  writeFileSync(join(d, '.claude', 'settings.json'), JSON.stringify({ hooks }));
+  return d;
+}
+
+/** Points `homedir()` at a scratch home carrying the user-level shim where
+ * `installClaudeGlobal` puts it. Both env vars, as `homedir()` reads a different one
+ * per platform. */
+async function withUserShim(fn: (userShim: string, home: string) => Promise<void> | void): Promise<void> {
+  const home = tmpRepo('twohooks-home');
+  const userShim = join(home, '.claude', 'helpers', 'graft-hooks.cjs');
+  mkdirSync(join(home, '.claude', 'helpers'), { recursive: true });
+  writeFileSync(userShim, '// the user-level shim\n');
+  const saved = { home: process.env.HOME, profile: process.env.USERPROFILE };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    await fn(userShim, home);
+  } finally {
+    if (saved.home === undefined) delete process.env.HOME; else process.env.HOME = saved.home;
+    if (saved.profile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.profile;
+  }
+}
+
+test('the user-level shim stands down only for a hook the repo runs itself', () => withUserShim((userShim, home) => {
+  const d = repoRunning('prompt', 'tool-savings');
+  assert.equal(shadowedByRepoHook(d, 'prompt', userShim), true);
+  assert.equal(shadowedByRepoHook(d, 'tool-savings', userShim), true);
+  // `post-edit` shares PostToolUse with `tool-savings`: the entry's tail decides, not the event.
+  assert.equal(shadowedByRepoHook(d, 'post-edit', userShim), false);
+  // Wired by an older graft that had no Stop hook: the user-level copy is the only one.
+  assert.equal(shadowedByRepoHook(d, 'stop', userShim), false);
+  // The repo's own copy never stands down.
+  assert.equal(shadowedByRepoHook(d, 'prompt', join(d, '.claude', 'helpers', 'graft-hooks.cjs')), false);
+  // Codex calls a shim of the same name with the same events, but Claude's repo hooks
+  // never run in a Codex session — a shim anywhere but ~/.claude/helpers is left alone.
+  assert.equal(shadowedByRepoHook(d, 'prompt', join(home, '.codex', 'hooks', 'graft', 'graft-hooks.cjs')), false);
+  assert.equal(shadowedByRepoHook(d, 'prompt', undefined), false);
+}));
+
+test('the worktree case: no repo shim, or no repo settings, and the user-level copy runs', () => withUserShim((userShim) => {
+  // .claude/helpers/ gitignored — settings.json names a shim that is not there.
+  const noShim = repoRunning('prompt');
+  rmSync(join(noShim, '.claude', 'helpers'), { recursive: true });
+  assert.equal(shadowedByRepoHook(noShim, 'prompt', userShim), false);
+  // .claude/settings.json gitignored — the shim is there and nothing runs it.
+  const noSettings = repoRunning('prompt');
+  rmSync(join(noSettings, '.claude', 'settings.json'));
+  assert.equal(shadowedByRepoHook(noSettings, 'prompt', userShim), false);
+  // Never wired at all.
+  assert.equal(shadowedByRepoHook(tmpRepo('twohooks-bare'), 'prompt', userShim), false);
+}));
+
+test('tool-savings from the user-level shim does not double count what the repo hook counts', () => withUserShim(async (userShim) => {
+  const d = repoRunning('tool-savings');
+  process.env.CLAUDE_PROJECT_DIR = d;
+  try {
+    const stdin = JSON.stringify({
+      session_id: 's1',
+      tool_name: 'Bash',
+      tool_response: { stdout: '[graft] tokens saved ≈ 2,181 (89%) — this output ≈ 258 tok …' },
+    });
+    // Claude Code fires both entries for the one tool use. The user-level one stands down…
+    await runWithStdin(stdin, () => main('tool-savings', userShim));
+    assert.equal(readSession(d, 's1').savedTokens, 0, 'nothing recorded by the user-level copy');
+    // …and the repo's own records it exactly once.
+    await runWithStdin(stdin, () => main('tool-savings', join(d, '.claude', 'helpers', 'graft-hooks.cjs')));
+    assert.equal(readSession(d, 's1').savedTokens, 2181);
+    assert.equal(readSession(d, 's1').graftReads, 1);
+  } finally {
+    delete process.env.CLAUDE_PROJECT_DIR;
+  }
+}));

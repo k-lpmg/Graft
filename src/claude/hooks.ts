@@ -1,7 +1,8 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, realpathSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
-import { join, basename, isAbsolute } from 'node:path';
+import { join, basename, isAbsolute, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { globalHelpersDir } from '../hosts/claude-global.js';
 import { readWiring } from './stats.js';
 import { formatBlastRadius, relevantRetrieval, formatOrientation } from './format.js';
 import { indexFreshness, staleBanner } from '../context/check.js';
@@ -62,6 +63,11 @@ export function promptAskTimeout(dir: string): number {
   return Math.max(MIN_CHILD_TIMEOUT_MS, installed - HOOK_OVERHEAD_MS);
 }
 
+/** The settings files inside the repo itself — what `graft init` writes to. */
+function repoSettingsFiles(dir: string): string[] {
+  return [join(dir, '.claude', 'settings.json'), join(dir, '.claude', 'settings.local.json')];
+}
+
 /**
  * Every settings file Claude Code merges hook definitions from, for a session
  * rooted at `dir`. The per-repo file is not the only place graft's hooks can be
@@ -70,11 +76,68 @@ export function promptAskTimeout(dir: string): number {
  */
 function hookSettingsFiles(dir: string): string[] {
   const user = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude');
-  return [
-    join(dir, '.claude', 'settings.json'),
-    join(dir, '.claude', 'settings.local.json'),
-    join(user, 'settings.json'),
-  ];
+  return [...repoSettingsFiles(dir), join(user, 'settings.json')];
+}
+
+/** One spelling for a file however it was named: symlinks resolved when it exists,
+ * absolute either way, and case-folded where the filesystem is. */
+function canonicalPath(p: string): string {
+  let out: string;
+  try { out = realpathSync(p); } catch { out = resolve(p); }
+  return process.platform === 'win32' ? out.toLowerCase() : out;
+}
+
+/** Does one of the repo's own settings files run graft's shim for `event`? Matched
+ * on the command's tail — `graft-hooks.cjs" post-edit` — because two of the entries
+ * share a settings event (`post-edit` and `tool-savings` are both PostToolUse). */
+function repoRunsHook(dir: string, event: string): boolean {
+  const tail = new RegExp(`graft-hooks\\.cjs"?\\s+${event.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&')}(?:\\s|$)`);
+  for (const file of repoSettingsFiles(dir)) {
+    let settings: any;
+    try { settings = JSON.parse(readFileSync(file, 'utf8')); } catch { continue; }
+    for (const blocks of Object.values(settings?.hooks ?? {})) {
+      if (!Array.isArray(blocks)) continue;
+      for (const block of blocks) {
+        for (const h of block?.hooks ?? []) {
+          if (typeof h?.command === 'string' && tail.test(h.command)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Is this process the user-level copy of a hook the repo already runs itself?
+ *
+ * `graft init` wires a repo in its own `.claude/settings.json`, and since #276 also
+ * under `~/.claude` — the floor that keeps graft alive in a worktree whose
+ * `.gitignore` swallowed the repo files. Claude Code runs every matching entry, so
+ * a repo that carries both copies (the common case: settings.json tracked, so every
+ * worktree has it) fires each hook twice. That is not just noise: two `graft ask`
+ * children race on every prompt and the pack is injected twice, `recordToolUse`
+ * counts every read and every `[graft]` footer twice, so `graft stats` and the
+ * session summary report double, and the SessionStart orientation lands twice.
+ *
+ * The repo's copy is the one to keep — it is the one the user ran `graft init`
+ * for — so the user-level copy stands down when the repo shim exists and the repo
+ * settings run it for this event. When the repo copy is missing (the worktree case
+ * the floor exists for) or the repo does not wire this event (wired by an older
+ * graft with fewer hooks), the user-level copy runs exactly as before.
+ *
+ * Only the Claude Code user-level shim ever stands down. Codex's user-level hooks
+ * call a shim of the same name with the same event args, but Claude's repo hooks
+ * never run in a Codex session, so a shim anywhere else is left alone.
+ *
+ * `shimPath` is `process.argv[1]` in the hook process: the shim file node was
+ * asked to run, which is how a process tells which of the two entries launched it.
+ */
+export function shadowedByRepoHook(dir: string, event: string, shimPath: string | undefined): boolean {
+  if (!shimPath) return false;
+  const userShim = join(globalHelpersDir(homedir()), 'graft-hooks.cjs');
+  if (canonicalPath(shimPath) !== canonicalPath(userShim)) return false;
+  if (!existsSync(join(dir, '.claude', 'helpers', 'graft-hooks.cjs'))) return false;
+  return repoRunsHook(dir, event);
 }
 
 /** The timeout on one settings file's graft hook entry for `event`, or null if it
@@ -391,9 +454,12 @@ function handleStop(input: any, dir: string): void {
   }
 }
 
-export async function main(event: string): Promise<void> {
+export async function main(event: string, shimPath: string | undefined = process.argv[1]): Promise<void> {
   const input = readStdin();
   const dir = projectDir(input);
+
+  // The repo's own hook is about to do (or is doing) exactly this; see shadowedByRepoHook.
+  if (shadowedByRepoHook(dir, event, shimPath)) return;
 
   if (event === 'session-start') {
     // Before anything is emitted: refresh this repo's wiring if it was written by
