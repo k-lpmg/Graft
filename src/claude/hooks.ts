@@ -3,6 +3,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { join, basename, isAbsolute, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { globalHelpersDir } from '../hosts/claude-global.js';
+import { toPosixPath } from '../util/paths.js';
 import { readWiring } from './stats.js';
 import { formatBlastRadius, relevantRetrieval, formatOrientation } from './format.js';
 import { indexFreshness, staleBanner } from '../context/check.js';
@@ -87,24 +88,46 @@ function canonicalPath(p: string): string {
   return process.platform === 'win32' ? out.toLowerCase() : out;
 }
 
-/** Does one of the repo's own settings files run graft's shim for `event`? Matched
- * on the command's tail — `graft-hooks.cjs" post-edit` — because two of the entries
- * share a settings event (`post-edit` and `tool-savings` are both PostToolUse). */
-function repoRunsHook(dir: string, event: string): boolean {
+/** The user-level shim, where hosts/claude-global.ts installs it. */
+function userShimPath(): string {
+  return join(globalHelpersDir(homedir()), 'graft-hooks.cjs');
+}
+
+/** Does this hook command name the user-level shim? Its command is written in posix
+ * form on every platform (see hosts/claude-global.ts), so both spellings count. */
+function namesUserShim(command: string, userShim: string): boolean {
+  const fold = (s: string) => (process.platform === 'win32' ? s.toLowerCase() : s);
+  const c = fold(command);
+  return c.includes(fold(userShim)) || c.includes(fold(toPosixPath(userShim)));
+}
+
+/**
+ * The graft hook entry for `event` in `files`, as the pair Claude Code fires it on:
+ * the settings event it sits under and its matcher (`''` when it has none). Matched
+ * on the command's tail — `graft-hooks.cjs" post-edit` — because two entries share
+ * a settings event (`post-edit` and `tool-savings` are both PostToolUse). `copy`
+ * picks which of the two installs the entry belongs to: 'user' wants the one whose
+ * command names the user-level shim, 'repo' any other.
+ */
+function graftHookEntry(
+  files: string[], event: string, copy: 'repo' | 'user', userShim: string,
+): { event: string; matcher: string } | null {
   const tail = new RegExp(`graft-hooks\\.cjs"?\\s+${event.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&')}(?:\\s|$)`);
-  for (const file of repoSettingsFiles(dir)) {
+  for (const file of files) {
     let settings: any;
     try { settings = JSON.parse(readFileSync(file, 'utf8')); } catch { continue; }
-    for (const blocks of Object.values(settings?.hooks ?? {})) {
+    for (const [key, blocks] of Object.entries(settings?.hooks ?? {})) {
       if (!Array.isArray(blocks)) continue;
       for (const block of blocks) {
         for (const h of block?.hooks ?? []) {
-          if (typeof h?.command === 'string' && tail.test(h.command)) return true;
+          if (typeof h?.command !== 'string' || !tail.test(h.command)) continue;
+          if ((copy === 'user') !== namesUserShim(h.command, userShim)) continue;
+          return { event: key, matcher: typeof block?.matcher === 'string' ? block.matcher : '' };
         }
       }
     }
   }
-  return false;
+  return null;
 }
 
 /**
@@ -120,10 +143,20 @@ function repoRunsHook(dir: string, event: string): boolean {
  * session summary report double, and the SessionStart orientation lands twice.
  *
  * The repo's copy is the one to keep — it is the one the user ran `graft init`
- * for — so the user-level copy stands down when the repo shim exists and the repo
- * settings run it for this event. When the repo copy is missing (the worktree case
- * the floor exists for) or the repo does not wire this event (wired by an older
- * graft with fewer hooks), the user-level copy runs exactly as before.
+ * for — so the user-level copy stands down when it can be sure the repo's copy
+ * fires on exactly the same occasions: the repo shim exists, a repo settings file
+ * runs it for this event by a command of its own (not one that names the user-level
+ * shim, or both copies would be this process and both would stand down), and that
+ * entry sits under the same settings event with the same matcher as the user-level
+ * entry. Same strings, so nothing here depends on how Claude Code interprets a
+ * matcher; a repo wired by an older graft — fewer hooks, or the narrower PostToolUse
+ * matcher from before 0.16 — keeps the user-level copy for whatever the two do not
+ * agree on, and a missing repo shim or settings (the worktree case the floor exists
+ * for) leaves it running exactly as before. Every mismatch errs toward the old
+ * double run, never toward silence.
+ *
+ * One occasion it cannot see: a `graft init` in a live session, whose new repo
+ * entries Claude Code loads on restart — which init already asks for.
  *
  * Only the Claude Code user-level shim ever stands down. Codex's user-level hooks
  * call a shim of the same name with the same event args, but Claude's repo hooks
@@ -134,10 +167,14 @@ function repoRunsHook(dir: string, event: string): boolean {
  */
 export function shadowedByRepoHook(dir: string, event: string, shimPath: string | undefined): boolean {
   if (!shimPath) return false;
-  const userShim = join(globalHelpersDir(homedir()), 'graft-hooks.cjs');
+  const userShim = userShimPath();
   if (canonicalPath(shimPath) !== canonicalPath(userShim)) return false;
   if (!existsSync(join(dir, '.claude', 'helpers', 'graft-hooks.cjs'))) return false;
-  return repoRunsHook(dir, event);
+  const repo = graftHookEntry(repoSettingsFiles(dir), event, 'repo', userShim);
+  if (!repo) return false;
+  const user = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude');
+  const mine = graftHookEntry([join(user, 'settings.json')], event, 'user', userShim);
+  return mine !== null && mine.event === repo.event && mine.matcher === repo.matcher;
 }
 
 /** The timeout on one settings file's graft hook entry for `event`, or null if it

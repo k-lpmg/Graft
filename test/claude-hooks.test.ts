@@ -9,6 +9,9 @@ import { runSync } from '../src/claude/sync-run.js';
 import { savingsLine } from '../src/context/savings.js';
 import { CI_ENV_VARS } from '../src/telemetry/gate.js';
 import { writeStats, emptyStats, acquireLock, resolveContextDir } from '../src/claude/state.js';
+import { mergeGraftHooks } from '../src/claude/settings-merge.js';
+import { installClaudeGlobal } from '../src/hosts/claude-global.js';
+import { toPosixPath } from '../src/util/paths.js';
 import { tmpRepo } from './helpers.js';
 
 test('underGraft detects edits inside graft/', () => {
@@ -759,36 +762,42 @@ test('session-start reads INDEX.md from a GRAFT_DIR-relocated context dir', asyn
 // matching entry, so a repo carrying both copies fires each hook twice. Only the repo's
 // copy should act. ──────────────────────────────────────────────────────────────────
 
-/** A repo `graft init` wired: its own shim, and settings that run it for `events`. */
+/** The event a graft hook command ends in — `… graft-hooks.cjs" tool-savings` → `tool-savings`. */
+const hookEvent = (h: any): string => /graft-hooks\.cjs"\s+(\S+)/.exec(String(h?.command ?? ''))?.[1] ?? '';
+
+/** A repo `graft init` wired: its own shim, and the real repo-form settings blocks
+ * (via the same merge init uses), kept only for `events` — a repo wired by an older
+ * graft has fewer of them. */
 function repoRunning(...events: string[]): string {
   const d = tmpRepo('twohooks');
   mkdirSync(join(d, '.claude', 'helpers'), { recursive: true });
   writeFileSync(join(d, '.claude', 'helpers', 'graft-hooks.cjs'), '// the repo shim\n');
+  const { merged } = mergeGraftHooks({}, '${CLAUDE_PROJECT_DIR:-.}/.claude/helpers');
   const hooks: Record<string, unknown[]> = {};
-  for (const e of events) {
-    const key = ({ prompt: 'UserPromptSubmit', stop: 'Stop', 'session-start': 'SessionStart' } as Record<string, string>)[e] ?? 'PostToolUse';
-    (hooks[key] ??= []).push({ hooks: [{ type: 'command', command: `node "\${CLAUDE_PROJECT_DIR:-.}/.claude/helpers/graft-hooks.cjs" ${e}`, timeout: 8000 }] });
+  for (const [key, blocks] of Object.entries(merged.hooks as Record<string, any[]>)) {
+    const kept = blocks.filter((b) => b.hooks.some((h: any) => events.includes(hookEvent(h))));
+    if (kept.length) hooks[key] = kept;
   }
   writeFileSync(join(d, '.claude', 'settings.json'), JSON.stringify({ hooks }));
   return d;
 }
 
-/** Points `homedir()` at a scratch home carrying the user-level shim where
- * `installClaudeGlobal` puts it. Both env vars, as `homedir()` reads a different one
- * per platform. */
+/** Points `homedir()` at a scratch home wired the real way — `installClaudeGlobal`
+ * writes the user-level shim and the hook entries that name it. Both env vars, as
+ * `homedir()` reads a different one per platform. */
 async function withUserShim(fn: (userShim: string, home: string) => Promise<void> | void): Promise<void> {
   const home = tmpRepo('twohooks-home');
-  const userShim = join(home, '.claude', 'helpers', 'graft-hooks.cjs');
-  mkdirSync(join(home, '.claude', 'helpers'), { recursive: true });
-  writeFileSync(userShim, '// the user-level shim\n');
-  const saved = { home: process.env.HOME, profile: process.env.USERPROFILE };
+  const saved = { home: process.env.HOME, profile: process.env.USERPROFILE, npx: process.env.GRAFT_MCP_NPX };
   process.env.HOME = home;
   process.env.USERPROFILE = home;
+  process.env.GRAFT_MCP_NPX = '1'; // pin the MCP launch command so nothing depends on graft being on PATH
   try {
-    await fn(userShim, home);
+    installClaudeGlobal(home);
+    await fn(join(home, '.claude', 'helpers', 'graft-hooks.cjs'), home);
   } finally {
     if (saved.home === undefined) delete process.env.HOME; else process.env.HOME = saved.home;
     if (saved.profile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.profile;
+    if (saved.npx === undefined) delete process.env.GRAFT_MCP_NPX; else process.env.GRAFT_MCP_NPX = saved.npx;
   }
 }
 
@@ -806,6 +815,28 @@ test('the user-level shim stands down only for a hook the repo runs itself', () 
   // never run in a Codex session — a shim anywhere but ~/.claude/helpers is left alone.
   assert.equal(shadowedByRepoHook(d, 'prompt', join(home, '.codex', 'hooks', 'graft', 'graft-hooks.cjs')), false);
   assert.equal(shadowedByRepoHook(d, 'prompt', undefined), false);
+}));
+
+test('the user-level shim keeps running where the two entries would not fire on the same occasions', () => withUserShim((userShim) => {
+  // A repo wired before 0.16 carries the narrower PostToolUse matcher: a Read fires
+  // the user-level entry only, so standing down would lose that source read.
+  const legacy = repoRunning('prompt', 'tool-savings');
+  const settingsPath = join(legacy, '.claude', 'settings.json');
+  const settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
+  for (const block of settings.hooks.PostToolUse) block.matcher = 'Bash|mcp__graft__';
+  writeFileSync(settingsPath, JSON.stringify(settings));
+  assert.equal(shadowedByRepoHook(legacy, 'tool-savings', userShim), false, 'matchers differ');
+  assert.equal(shadowedByRepoHook(legacy, 'prompt', userShim), true, 'the prompt entries still agree');
+
+  // A repo settings file that names the user-level shim instead of its own: both
+  // entries are then this process, and the repo copy standing down would leave nobody.
+  const pasted = repoRunning('prompt');
+  const pastedPath = join(pasted, '.claude', 'settings.json');
+  writeFileSync(pastedPath, readFileSync(pastedPath, 'utf8').replace('${CLAUDE_PROJECT_DIR:-.}/.claude/helpers', toPosixPath(join(userShim, '..'))));
+  const pastedCommand = JSON.parse(readFileSync(pastedPath, 'utf8')).hooks.UserPromptSubmit[0].hooks[0].command;
+  assert.match(pastedCommand, /graft-hooks\.cjs" prompt$/, 'still a prompt entry');
+  assert.ok(pastedCommand.includes(toPosixPath(userShim)), 'now names the user-level shim');
+  assert.equal(shadowedByRepoHook(pasted, 'prompt', userShim), false);
 }));
 
 test('the worktree case: no repo shim, or no repo settings, and the user-level copy runs', () => withUserShim((userShim) => {
