@@ -202,9 +202,11 @@ function hookTimeoutIn(file: string, event: string): number | null {
  * declares one.
  *
  * The smallest declared timeout wins rather than the nearest, because when more
- * than one file declares the hook Claude Code runs every matching entry and this
- * process cannot tell which one launched it. Guessing high is the expensive
- * mistake: an overrunning child gets the whole hook SIGKILLed, so `emit()` and
+ * than one file declares the hook Claude Code runs every matching entry, each
+ * under its own budget. The user-level copy stands down where the repo runs its
+ * own (see shadowedByRepoHook), but this lookup does not ask which entry it is
+ * in: the smallest budget fits either, and guessing high is the expensive
+ * mistake — an overrunning child gets the whole hook SIGKILLed, so `emit()` and
  * `writeSession()` never run and the turn silently gets no retrieval at all.
  * Guessing low only shortens one query.
  */
