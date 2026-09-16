@@ -640,8 +640,9 @@ test('promptAskTimeout reads a user-level hook when the repo declares none', () 
     // A repo with no .claude/ of its own still gets the budget it truly runs under.
     assert.equal(promptAskTimeout(mkdtempSync(join(tmpdir(), 'graft-nosettings-'))), 13000);
 
-    // Declared in both places: Claude Code fires both entries and this process
-    // cannot tell which launched it, so the smallest budget is the only safe one.
+    // Declared in both places: Claude Code fires both entries, each under its own
+    // budget. The lookup does not ask which one this is, so the smallest budget —
+    // the one that fits either — is the safe one.
     assert.equal(promptAskTimeout(withSettings(8000)), 6000);
 
     process.env.CLAUDE_CONFIG_DIR = withUserSettings(8000);
