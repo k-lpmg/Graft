@@ -1,6 +1,6 @@
 import { readFileSync, existsSync, realpathSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
-import { join, basename, isAbsolute, resolve } from 'node:path';
+import { join, basename, isAbsolute, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { globalHelpersDir } from '../hosts/claude-global.js';
 import { toPosixPath } from '../util/paths.js';
@@ -97,12 +97,27 @@ function userShimPath(): string {
   return join(globalHelpersDir(homedir()), 'graft-hooks.cjs');
 }
 
-/** Does this hook command name the user-level shim? Its command is written in posix
- * form on every platform (see hosts/claude-global.ts), so both spellings count. */
+/**
+ * Does this hook command name the user-level shim? Any spelling of it counts: the
+ * absolute path, with either separator, or the path below the shell's home
+ * variable — `$HOME/…`, or `%USERPROFILE%/…` since cmd.exe has no `$HOME` — the
+ * form that keeps a version-controlled `~/.claude/settings.json` right on the
+ * next machine.
+ *
+ * All of them on every platform, even a variable this platform's shell leaves
+ * unexpanded. A spelling missed here reads as a command of the repo's own, and a
+ * repo entry that really runs the user-level shim, or runs nothing at all, would
+ * then stand the user-level copy down with nobody left to act.
+ */
 function namesUserShim(command: string, userShim: string): boolean {
-  const fold = (s: string) => (process.platform === 'win32' ? s.toLowerCase() : s);
-  const c = fold(command);
-  return c.includes(fold(userShim)) || c.includes(fold(toPosixPath(userShim)));
+  const norm = (s: string) => {
+    const p = toPosixPath(s);
+    return process.platform === 'win32' ? p.toLowerCase() : p;
+  };
+  const below = relative(homedir(), userShim);
+  const c = norm(command);
+  return [userShim, ...['$HOME', '${HOME}', '%USERPROFILE%'].map((v) => `${v}/${below}`)]
+    .some((s) => c.includes(norm(s)));
 }
 
 /**

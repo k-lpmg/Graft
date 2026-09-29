@@ -766,21 +766,33 @@ test('session-start reads INDEX.md from a GRAFT_DIR-relocated context dir', asyn
 /** The event a graft hook command ends in — `… graft-hooks.cjs" tool-savings` → `tool-savings`. */
 const hookEvent = (h: any): string => /graft-hooks\.cjs"\s+(\S+)/.exec(String(h?.command ?? ''))?.[1] ?? '';
 
-/** A repo `graft init` wired: its own shim, and the real repo-form settings blocks
- * (via the same merge init uses), kept only for `events` — a repo wired by an older
- * graft has fewer of them. */
-function repoRunning(...events: string[]): string {
-  const d = tmpRepo('twohooks');
-  mkdirSync(join(d, '.claude', 'helpers'), { recursive: true });
-  writeFileSync(join(d, '.claude', 'helpers', 'graft-hooks.cjs'), '// the repo shim\n');
-  const { merged } = mergeGraftHooks({}, '${CLAUDE_PROJECT_DIR:-.}/.claude/helpers');
+/** graft's real hook blocks (via the same merge init uses) with the shim under
+ * `helpers`, kept only for `events` — a repo wired by an older graft has fewer of them. */
+function graftHooks(helpers: string, events: string[]): Record<string, unknown[]> {
+  const { merged } = mergeGraftHooks({}, helpers);
   const hooks: Record<string, unknown[]> = {};
   for (const [key, blocks] of Object.entries(merged.hooks as Record<string, any[]>)) {
     const kept = blocks.filter((b) => b.hooks.some((h: any) => events.includes(hookEvent(h))));
     if (kept.length) hooks[key] = kept;
   }
-  writeFileSync(join(d, '.claude', 'settings.json'), JSON.stringify({ hooks }));
+  return hooks;
+}
+
+/** A repo `graft init` wired: its own shim, and the repo-form settings blocks for `events`. */
+function repoRunning(...events: string[]): string {
+  const d = tmpRepo('twohooks');
+  mkdirSync(join(d, '.claude', 'helpers'), { recursive: true });
+  writeFileSync(join(d, '.claude', 'helpers', 'graft-hooks.cjs'), '// the repo shim\n');
+  writeFileSync(join(d, '.claude', 'settings.json'), JSON.stringify({ hooks: graftHooks('${CLAUDE_PROJECT_DIR:-.}/.claude/helpers', events) }));
   return d;
+}
+
+/** Every way a hook command can name the user-level shim's directory: the absolute
+ * path, posix (as init writes it) or native, and the path below the shell's home
+ * variable, the form that keeps a version-controlled settings.json portable. */
+function userHelpersSpellings(home: string): string[] {
+  const abs = join(home, '.claude', 'helpers');
+  return [toPosixPath(abs), abs, '$HOME/.claude/helpers', '${HOME}/.claude/helpers', '%USERPROFILE%/.claude/helpers'];
 }
 
 /** Points `homedir()` at a scratch home wired the real way — `installClaudeGlobal`
@@ -818,7 +830,16 @@ test('the user-level shim stands down only for a hook the repo runs itself', () 
   assert.equal(shadowedByRepoHook(d, 'prompt', undefined), false);
 }));
 
-test('the user-level shim keeps running where the two entries would not fire on the same occasions', () => withUserShim((userShim) => {
+test('the user-level entry counts however its command spells the shim', () => withUserShim((userShim, home) => {
+  const d = repoRunning('prompt');
+  for (const helpers of userHelpersSpellings(home)) {
+    // What installClaudeGlobal writes into a fresh home, with the directory spelled this way.
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify(mergeGraftHooks({}, helpers).merged));
+    assert.equal(shadowedByRepoHook(d, 'prompt', userShim), true, helpers);
+  }
+}));
+
+test('the user-level shim keeps running where the two entries would not fire on the same occasions', () => withUserShim((userShim, home) => {
   // A repo wired before 0.16 carries the narrower PostToolUse matcher: a Read fires
   // the user-level entry only, so standing down would lose that source read.
   const legacy = repoRunning('prompt', 'tool-savings');
@@ -829,15 +850,15 @@ test('the user-level shim keeps running where the two entries would not fire on 
   assert.equal(shadowedByRepoHook(legacy, 'tool-savings', userShim), false, 'matchers differ');
   assert.equal(shadowedByRepoHook(legacy, 'prompt', userShim), true, 'the prompt entries still agree');
 
-  // A repo settings file that names the user-level shim instead of its own: both
-  // entries are then this process, and the repo copy standing down would leave nobody.
-  const pasted = repoRunning('prompt');
-  const pastedPath = join(pasted, '.claude', 'settings.json');
-  writeFileSync(pastedPath, readFileSync(pastedPath, 'utf8').replace('${CLAUDE_PROJECT_DIR:-.}/.claude/helpers', toPosixPath(join(userShim, '..'))));
-  const pastedCommand = JSON.parse(readFileSync(pastedPath, 'utf8')).hooks.UserPromptSubmit[0].hooks[0].command;
-  assert.match(pastedCommand, /graft-hooks\.cjs" prompt$/, 'still a prompt entry');
-  assert.ok(pastedCommand.includes(toPosixPath(userShim)), 'now names the user-level shim');
-  assert.equal(shadowedByRepoHook(pasted, 'prompt', userShim), false);
+  // A repo settings file that names the user-level shim instead of its own, in any of
+  // its spellings: both entries are then this process, and the repo copy standing
+  // down would leave nobody.
+  for (const helpers of userHelpersSpellings(home)) {
+    const pasted = repoRunning('prompt');
+    assert.equal(shadowedByRepoHook(pasted, 'prompt', userShim), true, 'wired by init, it stands down');
+    writeFileSync(join(pasted, '.claude', 'settings.json'), JSON.stringify({ hooks: graftHooks(helpers, ['prompt']) }));
+    assert.equal(shadowedByRepoHook(pasted, 'prompt', userShim), false, helpers);
+  }
 }));
 
 test('the worktree case: no repo shim, or no repo settings, and the user-level copy runs', () => withUserShim((userShim) => {
